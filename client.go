@@ -3,12 +3,14 @@ package modbus
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +32,10 @@ const (
 	// word order of 32-bit registers
 	HIGH_WORD_FIRST     WordOrder = 1
 	LOW_WORD_FIRST      WordOrder = 2
+)
+
+var (
+    ErrConnectionClosed = errors.New("connection closed by peer")
 )
 
 // Modbus client configuration object.
@@ -58,6 +64,12 @@ type ClientConfiguration struct {
 	Logger        *log.Logger
 }
 
+
+type connState struct {
+    transport transport
+    closed    atomic.Bool
+}
+
 // Modbus client object.
 type ModbusClient struct {
 	conf          ClientConfiguration
@@ -65,7 +77,7 @@ type ModbusClient struct {
 	lock          sync.Mutex
 	endianness    Endianness
 	wordOrder     WordOrder
-	transport     transport
+	conn          atomic.Pointer[connState]
 	unitId        uint8
 	transportType transportType
 }
@@ -196,16 +208,14 @@ func NewClient(conf *ClientConfiguration) (mc *ModbusClient, err error) {
 	return
 }
 
-// Opens the underlying transport (network socket or serial line).
-func (mc *ModbusClient) Open() (err error) {
-	var spw		*serialPortWrapper
-	var sock	net.Conn
 
-	mc.lock.Lock()
-	defer mc.lock.Unlock()
+func (mc *ModbusClient) createTransport() (transport, error) {
+    var spw *serialPortWrapper
+    var sock net.Conn
+    var err error
 
-	switch mc.transportType {
-	case modbusRTU:
+    switch mc.transportType {
+ 	case modbusRTU:
 		// create a serial port wrapper object
 		spw = newSerialPortWrapper(&serialPortConfig{
 			Device:		mc.conf.URL,
@@ -218,54 +228,51 @@ func (mc *ModbusClient) Open() (err error) {
 		// open the serial device
 		err = spw.Open()
 		if err != nil {
-			return
+			return nil, err
 		}
 
 		// discard potentially stale serial data
 		discard(spw)
 
-		// create the RTU transport
-		mc.transport = newRTUTransport(
-			spw, mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger)
+		return newRTUTransport(
+			spw, mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger), nil
 
 	case modbusRTUOverTCP:
 		// connect to the remote host
 		sock, err = net.DialTimeout("tcp", mc.conf.URL, 5 * time.Second)
 		if err != nil {
-			return
+			return nil, err
 		}
 
 		// discard potentially stale serial data
 		discard(sock)
 
-		// create the RTU transport
-		mc.transport = newRTUTransport(
-			sock, mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger)
+		return newRTUTransport(
+			sock, mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger), nil
 
 	case modbusRTUOverUDP:
 		// open a socket to the remote host (note: no actual connection is
 		// being made as UDP is connection-less)
 		sock, err = net.DialTimeout("udp", mc.conf.URL, 5 * time.Second)
 		if err != nil {
-			return
+			return nil, err
 		}
 
 		// create the RTU transport, wrapping the UDP socket in
 		// an adapter to allow the transport to read the stream of
 		// packets byte per byte
-		mc.transport = newRTUTransport(
+		return newRTUTransport(
 			newUDPSockWrapper(sock),
-			mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger)
+			mc.conf.URL, mc.conf.Speed, mc.conf.Timeout, mc.conf.Logger), nil
 
 	case modbusTCP:
 		// connect to the remote host
 		sock, err = net.DialTimeout("tcp", mc.conf.URL, 5 * time.Second)
 		if err != nil {
-			return
+			return nil, err
 		}
 
-		// create the TCP transport
-		mc.transport = newTCPTransport(sock, mc.conf.Timeout, mc.conf.Logger)
+		return newTCPTransport(sock, mc.conf.Timeout, mc.conf.Logger), nil
 
 	case modbusTCPOverTLS:
 		// connect to the remote host with TLS
@@ -282,53 +289,97 @@ func (mc *ModbusClient) Open() (err error) {
 				MinVersion:  tls.VersionTLS12,
 			})
 		if err != nil {
-			return
+			return nil, err
 		}
 
 		// force the TLS handshake
 		err = sock.(*tls.Conn).Handshake()
 		if err != nil {
 			sock.Close()
-			return
+			return nil, err
 		}
 
 		// create the TCP transport, wrapping the TLS socket in
 		// an adapter to work around write timeouts corrupting internal
 		// state (see https://pkg.go.dev/crypto/tls#Conn.SetWriteDeadline)
-		mc.transport = newTCPTransport(
-			newTLSSockWrapper(sock), mc.conf.Timeout, mc.conf.Logger)
+		return newTCPTransport(
+			newTLSSockWrapper(sock), mc.conf.Timeout, mc.conf.Logger), nil
 
 	case modbusTCPOverUDP:
 		// open a socket to the remote host (note: no actual connection is
 		// being made as UDP is connection-less)
 		sock, err = net.DialTimeout("udp", mc.conf.URL, 5 * time.Second)
 		if err != nil {
-			return
+			return nil, err
 		}
 
 		// create the TCP transport, wrapping the UDP socket in
 		// an adapter to allow the transport to read the stream of
 		// packets byte per byte
-		mc.transport = newTCPTransport(
-			newUDPSockWrapper(sock), mc.conf.Timeout, mc.conf.Logger)
+		return newTCPTransport(
+			newUDPSockWrapper(sock), mc.conf.Timeout, mc.conf.Logger), nil
 
 	default:
 		// should never happen
 		err = ErrConfigurationError
 	}
 
-	return
+	return nil, ErrConfigurationError
+}
+
+// Opens the underlying transport (network socket or serial line).
+func (mc *ModbusClient) Open() (err error) {
+	transport, err := mc.createTransport()
+    if err != nil {
+        return err
+    }
+
+    conn := &connState{
+        transport: transport,
+    }
+    mc.conn.Store(conn)
+    return nil
+}
+
+
+func (mc *ModbusClient) Reconnect() error {
+    newTransport, err := mc.createTransport()
+    if err != nil {
+        return fmt.Errorf("failed to create new transport: %w", err)
+    }
+
+    // Get current connection state
+    oldConn := mc.conn.Load()
+    if oldConn != nil {
+        oldConn.transport.Close()
+        oldConn.closed.Store(true)
+    }
+
+    // Store new connection
+    newConn := &connState{
+        transport: newTransport,
+    }
+    mc.conn.Store(newConn)
+    
+    return nil
 }
 
 // Closes the underlying transport.
 func (mc *ModbusClient) Close() (err error) {
-	mc.lock.Lock()
-	defer mc.lock.Unlock()
-
-	if mc.transport != nil {
-		err = mc.transport.Close()
+	conn := mc.conn.Load()
+	if conn == nil {
+		mc.logger.Error("no connection to close")
+		return
 	}
-
+	if conn.closed.Load() {
+		mc.logger.Error("connection already closed")
+		return
+	}
+	if err = conn.transport.Close(); err != nil {
+		mc.logger.Errorf("failed to close connection: %v", err)
+		return
+	}
+	conn.closed.Store(true)
 	return
 }
 
@@ -1184,8 +1235,28 @@ func (mc *ModbusClient) writeRegisters(addr uint16, values []byte) (err error) {
 }
 
 func (mc *ModbusClient) executeRequest(req *pdu) (res *pdu, err error) {
+	conn := mc.conn.Load()
+	if conn == nil || conn.closed.Load() {
+		return nil, ErrConnectionClosed
+	}
+
 	// send the request over the wire, wait for and decode the response
-	res, err	= mc.transport.ExecuteRequest(req)
+	res, err	= conn.transport.ExecuteRequest(req)
+
+	// If connection was closed, try one reconnection attempt
+    if err == ErrConnectionClosed {
+        mc.logger.Warning("Connection closed, attempting reconnection...")
+        if rerr := mc.Reconnect(); rerr != nil {
+            return nil, fmt.Errorf("reconnection failed: %w", rerr)
+        }
+        // Retry the request after successful reconnection
+		conn = mc.conn.Load()
+		if conn == nil {
+			return nil, ErrConnectionClosed
+		}
+        res, err = conn.transport.ExecuteRequest(req)
+    }
+
 	if err != nil {
 		// map i/o timeouts to ErrRequestTimedOut
 		if os.IsTimeout(err) {
