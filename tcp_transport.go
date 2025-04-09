@@ -134,6 +134,10 @@ func (tt *tcpTransport) readMBAPFrame() (p *pdu, txnId uint16, err error) {
 	rxbuf		= make([]byte, mbapHeaderLength)
 	_, err		= io.ReadFull(tt.socket, rxbuf)
 	if err != nil {
+		if err == io.EOF {
+            tt.socket.Close()
+            err = ErrConnectionClosed
+        }
 		return
 	}
 
@@ -166,6 +170,10 @@ func (tt *tcpTransport) readMBAPFrame() (p *pdu, txnId uint16, err error) {
 	rxbuf		= make([]byte, bytesNeeded)
 	_, err		= io.ReadFull(tt.socket, rxbuf)
 	if err != nil {
+		if err == io.EOF {
+            tt.socket.Close()
+            err = ErrConnectionClosed
+        }
 		return
 	}
 
