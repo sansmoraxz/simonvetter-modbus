@@ -35,7 +35,7 @@ const (
 )
 
 var (
-    ErrConnectionClosed = errors.New("connection closed by peer")
+	ErrConnectionClosed = errors.New("connection closed by peer")
 )
 
 // Modbus client configuration object.
@@ -66,8 +66,8 @@ type ClientConfiguration struct {
 
 
 type connState struct {
-    transport transport
-    closed    atomic.Bool
+	transport transport
+	closed    atomic.Bool
 }
 
 // Modbus client object.
@@ -210,12 +210,12 @@ func NewClient(conf *ClientConfiguration) (mc *ModbusClient, err error) {
 
 
 func (mc *ModbusClient) createTransport() (transport, error) {
-    var spw *serialPortWrapper
-    var sock net.Conn
-    var err error
+	var spw *serialPortWrapper
+	var sock net.Conn
+	var err error
 
-    switch mc.transportType {
- 	case modbusRTU:
+	switch mc.transportType {
+		case modbusRTU:
 		// create a serial port wrapper object
 		spw = newSerialPortWrapper(&serialPortConfig{
 			Device:		mc.conf.URL,
@@ -330,38 +330,38 @@ func (mc *ModbusClient) createTransport() (transport, error) {
 // Opens the underlying transport (network socket or serial line).
 func (mc *ModbusClient) Open() (err error) {
 	transport, err := mc.createTransport()
-    if err != nil {
-        return err
-    }
+	if err != nil {
+	return err
+	}
 
-    conn := &connState{
-        transport: transport,
-    }
-    mc.conn.Store(conn)
-    return nil
+	conn := &connState{
+	transport: transport,
+	}
+	mc.conn.Store(conn)
+	return nil
 }
 
 
 func (mc *ModbusClient) Reconnect() error {
-    newTransport, err := mc.createTransport()
-    if err != nil {
-        return fmt.Errorf("failed to create new transport: %w", err)
-    }
+	newTransport, err := mc.createTransport()
+	if err != nil {
+	return fmt.Errorf("failed to create new transport: %w", err)
+	}
 
-    // Get current connection state
-    oldConn := mc.conn.Load()
-    if oldConn != nil {
-        oldConn.transport.Close()
-        oldConn.closed.Store(true)
-    }
+	// Get current connection state
+	oldConn := mc.conn.Load()
+	if oldConn != nil {
+	oldConn.transport.Close()
+	oldConn.closed.Store(true)
+	}
 
-    // Store new connection
-    newConn := &connState{
-        transport: newTransport,
-    }
-    mc.conn.Store(newConn)
-    
-    return nil
+	// Store new connection
+	newConn := &connState{
+	transport: newTransport,
+	}
+	mc.conn.Store(newConn)
+	
+	return nil
 }
 
 // Closes the underlying transport.
@@ -1244,18 +1244,18 @@ func (mc *ModbusClient) executeRequest(req *pdu) (res *pdu, err error) {
 	res, err	= conn.transport.ExecuteRequest(req)
 
 	// If connection was closed, try one reconnection attempt
-    if err == ErrConnectionClosed {
-        mc.logger.Warning("Connection closed, attempting reconnection...")
-        if rerr := mc.Reconnect(); rerr != nil {
-            return nil, fmt.Errorf("reconnection failed: %w", rerr)
-        }
-        // Retry the request after successful reconnection
+	if err == ErrConnectionClosed {
+	mc.logger.Warning("Connection closed, attempting reconnection...")
+	if rerr := mc.Reconnect(); rerr != nil {
+	return nil, fmt.Errorf("reconnection failed: %w", rerr)
+	}
+	// Retry the request after successful reconnection
 		conn = mc.conn.Load()
 		if conn == nil {
 			return nil, ErrConnectionClosed
 		}
-        res, err = conn.transport.ExecuteRequest(req)
-    }
+	res, err = conn.transport.ExecuteRequest(req)
+	}
 
 	if err != nil {
 		// map i/o timeouts to ErrRequestTimedOut
